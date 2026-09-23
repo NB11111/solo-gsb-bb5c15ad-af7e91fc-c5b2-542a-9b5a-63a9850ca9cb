@@ -121,3 +121,22 @@ class BeamEvaluationOut(BaseModel):
     centroid: Vec2 | None
     rms_radius: float | None
     rays: list[BeamRayOut]
+
+
+class AimRequest(BeamRequest):
+    """瞄准求解请求：在光束请求基础上增加目标偏移量。
+
+    目标偏移量：沿观察线单位切向量（法线逆时针旋转 90°）相对观察线给定点的
+    有符号距离，即目标点 = 观察线给定点 + target_offset · 切向量。
+    """
+
+    target_offset: float = Field(
+        description="目标点沿观察线单位切向量相对观察线给定点的有符号距离"
+    )
+
+
+class AimSolutionOut(BaseModel):
+    emission_angle_deg: float
+    exit_direction: Vec2
+    observation_point: Vec2
+    target_deviation: float

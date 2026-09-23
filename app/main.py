@@ -6,6 +6,9 @@ GET  /api/traces/{trace_id}           按编号查询完整追迹（含各段交
 GET  /api/traces/{trace_id}/segments/{seg_index}  按编号查询某一段
 POST /api/beam-evaluations            以中心方向为轴对称采样多条光线，返回每条光线
                                       的发射角、追迹状态、观察线交点及质心/RMS 半径
+POST /api/aim-solutions               在半角范围内扫描发射角并对偏差异号区间二分，
+                                      求解命中观察线目标偏移量的光线，返回角度、
+                                      出射方向、观察线交点与目标偏差（不入库）
 """
 from __future__ import annotations
 
@@ -15,12 +18,15 @@ from fastapi import FastAPI, HTTPException
 
 from . import db
 from .geometry import (
+    aim_solutions,
     centroid_and_rms,
     observation_intersection,
     sample_directions,
     trace_ray,
 )
 from .schemas import (
+    AimRequest,
+    AimSolutionOut,
     BeamEvaluationOut,
     BeamRequest,
     SegmentOut,
@@ -146,3 +152,38 @@ def evaluate_beam(req: BeamRequest) -> dict:
         "rms_radius": None if stats is None else stats[1],
         "rays": rays_out,
     }
+
+
+@app.post("/api/aim-solutions", response_model=list[AimSolutionOut])
+def compute_aim_solutions(req: AimRequest) -> list[dict]:
+    """扫描 + 二分求解使出射光线命中观察线目标位置的发射角。
+
+    目标偏移量：沿观察线单位切向量（法线逆时针旋转 90°）相对观察线给定点的
+    有符号距离。在半角范围内等间距扫描，仅对相邻有效采样偏差异号的区间二分；
+    采样点直接命中（|偏差| ≤ 1e-6）也记为解。结果按角度升序、按 1e-7 度去重，
+    无解时返回空列表。该接口为即时计算，不写入数据库。
+    """
+    interfaces = [
+        (itf.point.as_tuple(), itf.normal.as_tuple(), itf.n_next)
+        for itf in req.interfaces
+    ]
+    solutions = aim_solutions(
+        req.start.as_tuple(),
+        req.center_direction.as_tuple(),
+        req.half_angle_deg,
+        req.sample_count,
+        req.n_start,
+        interfaces,
+        req.observation_line.point.as_tuple(),
+        req.observation_line.normal.as_tuple(),
+        req.target_offset,
+    )
+    return [
+        {
+            "emission_angle_deg": angle,
+            "exit_direction": {"x": exit_dir[0], "y": exit_dir[1]},
+            "observation_point": {"x": point[0], "y": point[1]},
+            "target_deviation": deviation,
+        }
+        for angle, exit_dir, point, deviation in solutions
+    ]

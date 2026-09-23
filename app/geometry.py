@@ -13,6 +13,10 @@ from dataclasses import dataclass
 EPS = 1e-12
 T_MIN = 1e-9  # 交点参数 t 必须大于该值，避免自相交
 
+AIM_DEV_TOL = 1e-6  # 目标偏差容差：|偏差| 不大于该值即视为命中
+AIM_ANGLE_TOL_DEG = 1e-7  # 角度区间宽容差（度）：二分停止条件，兼作解去重阈值
+AIM_MAX_ITER = 60  # 单个异号区间的最大二分迭代次数
+
 
 def _dot(a: tuple[float, float], b: tuple[float, float]) -> float:
     return a[0] * b[0] + a[1] * b[1]
@@ -175,3 +179,103 @@ def trace_ray(
     # 穿过所有界面，最后一段出射
     segments.append(SegmentResult(origin, d, n_current, None, None, None))
     return segments, "completed", None
+
+
+def aim_solutions(
+    start: tuple[float, float],
+    center_direction: tuple[float, float],
+    half_angle_deg: float,
+    sample_count: int,
+    n_start: float,
+    interfaces: list[tuple[tuple[float, float], tuple[float, float], float]],
+    obs_point: tuple[float, float],
+    obs_normal: tuple[float, float],
+    target_offset: float,
+) -> list[tuple[float, tuple[float, float], tuple[float, float], float]]:
+    """求解使出射光线命中观察线上目标位置的发射角（扫描 + 异号区间二分）。
+
+    目标位置 = obs_point + target_offset · t，其中 t 为观察线单位切向量
+    （法线逆时针旋转 90°）；目标偏差 = 观察线交点相对目标位置沿 t 的有符号距离。
+
+    流程：
+    - 在 [-half_angle_deg, +half_angle_deg]（度，含端点）内等间距取 sample_count
+      个发射角逐一求偏差，|偏差| ≤ 1e-6 的采样点直接记为解；
+    - 仅对相邻有效采样（追迹完成且与观察线有前向交点）偏差异号的区间做二分，
+      二分过程中遇无效追迹或无前向交点即丢弃该区间，不跨无效采样连根；
+    - 二分停止条件：|偏差| ≤ 1e-6 或角度区间宽 ≤ 1e-7 度，最多迭代 60 次。
+
+    返回 [(angle_deg, exit_direction, observation_point, deviation), ...]，
+    按角度升序、按 1e-7 度去重（保留 |偏差| 较小者）；无解时为空列表。
+    """
+    nrm = normalize(obs_normal)
+    tangent = (-nrm[1], nrm[0])  # 法线逆时针旋转 90° 得单位切向量
+    base = normalize(center_direction)
+    theta0 = math.atan2(base[1], base[0])
+
+    def evaluate(
+        angle_deg: float,
+    ) -> tuple[float, tuple[float, float], tuple[float, float]] | None:
+        """指定发射角的目标偏差、出射方向与观察线交点；无效时返回 None。"""
+        theta = theta0 + math.radians(angle_deg)
+        direction = (math.cos(theta), math.sin(theta))
+        segments, status, _ = trace_ray(start, direction, n_start, interfaces)
+        if status != "completed":
+            return None
+        point = observation_intersection(segments, obs_point, obs_normal)
+        if point is None:
+            return None
+        deviation = (
+            _dot((point[0] - obs_point[0], point[1] - obs_point[1]), tangent)
+            - target_offset
+        )
+        return deviation, segments[-1].direction, point
+
+    solutions: list[
+        tuple[float, tuple[float, float], tuple[float, float], float]
+    ] = []
+
+    # 扫描：等间距采样，记录每个采样点的求值结果，直接命中者先记为解
+    sampled: list[
+        tuple[float, tuple[float, tuple[float, float], tuple[float, float]] | None]
+    ] = []
+    for angle, _ in sample_directions(center_direction, half_angle_deg, sample_count):
+        result = evaluate(angle)
+        sampled.append((angle, result))
+        if result is not None and abs(result[0]) <= AIM_DEV_TOL:
+            solutions.append((angle, result[1], result[2], result[0]))
+
+    # 相邻有效采样偏差异号的区间二分求根
+    for (a0, r0), (a1, r1) in zip(sampled, sampled[1:]):
+        if r0 is None or r1 is None:
+            continue  # 不跨无效采样连根
+        d0, d1 = r0[0], r1[0]
+        if d0 * d1 >= 0.0:
+            continue  # 仅处理严格异号区间（零偏差采样已在扫描阶段记录）
+        lo, hi = a0, a1
+        d_lo = d0
+        for _ in range(AIM_MAX_ITER):
+            mid = 0.5 * (lo + hi)
+            r_mid = evaluate(mid)
+            if r_mid is None:
+                break  # 二分遇无效追迹或无前向交点：丢弃该区间
+            d_mid = r_mid[0]
+            if abs(d_mid) <= AIM_DEV_TOL or (hi - lo) <= AIM_ANGLE_TOL_DEG:
+                solutions.append((mid, r_mid[1], r_mid[2], d_mid))
+                break
+            if d_lo * d_mid < 0.0:
+                hi = mid
+            else:
+                lo, d_lo = mid, d_mid
+
+    # 按角度升序排序，按 1e-7 度去重（同簇保留 |偏差| 较小者）
+    solutions.sort(key=lambda s: s[0])
+    deduped: list[
+        tuple[float, tuple[float, float], tuple[float, float], float]
+    ] = []
+    for sol in solutions:
+        if deduped and sol[0] - deduped[-1][0] <= AIM_ANGLE_TOL_DEG:
+            if abs(sol[3]) < abs(deduped[-1][3]):
+                deduped[-1] = sol
+            continue
+        deduped.append(sol)
+    return deduped
