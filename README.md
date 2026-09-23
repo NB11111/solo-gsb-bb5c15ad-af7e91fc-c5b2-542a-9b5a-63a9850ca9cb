@@ -30,6 +30,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/traces/{trace_id}` | 按编号查询完整追迹（含各段交点与方向） |
 | GET | `/api/traces/{trace_id}/segments/{seg_index}` | 按编号查询某一段的交点与方向 |
 | POST | `/api/beam-evaluations` | 扇形采样多条光线逐条追迹，返回各光线发射角、状态、观察线交点及质心/RMS（不入库） |
+| POST | `/api/aim-solutions` | 扫描发射角并二分求穿过观察线上目标点的光线，返回排序去重后的解（不入库） |
 
 ### 请求示例
 
@@ -125,6 +126,74 @@ curl -X POST http://localhost:8000/api/beam-evaluations \
 - `ray_count`：实际追迹的光线数（等于 `sample_count`）；`hit_count`：观察线上存在有效前向交点的光线数。
 - `rays[]` 按发射角从 `-a` 到 `+a` 排列，每条含 `emission_angle_deg`（相对中心方向的发射角，度）、`direction`（归一化后的实际发射方向）、`status` / `reason`（复用单光线追迹的状态与停止原因）、`observation_point`（观察线前向交点，无效时为 `null`）。
 - 无任何命中时：`hit_count` 为 0，`centroid` 与 `rms_radius` 均为 `null`。
+
+## 瞄准求解
+
+`POST /api/aim-solutions` 接收与光束评估相同的起点、中心方向、起始折射率、顺序界面、观察线、对称半角与扫描数，另接收目标偏移量 `target_offset`：它是沿观察线**单位切向量**（观察线法线归一化后逆时针旋转 90°，即 `(nx, ny) -> (-ny, nx)`）相对观察线给定点的**有符号距离**，目标点为
+
+```
+P_target = observation_line.point + target_offset * tangent
+```
+
+在 `[-half_angle_deg, +half_angle_deg]`（度，含端点）内等间距扫描发射角，复用现有追迹与出射段—观察线前向求交，目标偏差为交点沿切向相对目标点的有符号距离。随后：
+
+- **仅**对**相邻**两个有效采样（追迹 `completed` 且存在前向观察线交点）目标偏差异号的区间作二分；无效采样（全反射 / 中途无交点 / 与观察线平行 / 交点在反方向）两侧不视为相邻，**不跨无效采样连根**。
+- 二分中若中点追迹无效或无前向观察线交点，**直接丢弃该区间**。
+- 停止条件（满足任一）：目标偏差绝对值不超过 `1e-6`；角度区间宽度不超过 `1e-7` 度（取偏差更小的端点）；最多迭代 `60` 次（兜底）。
+- 采样点本身直接命中（`|偏差| <= 1e-6`）同样作为解返回。
+- 返回解按发射角排序、相邻角度差不超过 `1e-7` 度时去重（保留偏差更小者）；无解时 `solutions` 为空列表、`solution_count` 为 0。该接口为即时计算，不写入数据库。
+
+- **API 地址**：http://localhost:8000/api/aim-solutions（Swagger 文档：http://localhost:8000/docs#/default/solve_aim_solutions_api_aim_solutions_post）
+
+### 瞄准求解请求示例
+
+```bash
+curl -X POST http://localhost:8000/api/aim-solutions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "start": {"x": 0, "y": 0},
+    "center_direction": {"x": 1, "y": 0},
+    "half_angle_deg": 10,
+    "sample_count": 21,
+    "target_offset": 1.0,
+    "n_start": 1.0,
+    "interfaces": [
+      {"point": {"x": 2, "y": 0}, "normal": {"x": 1, "y": 0}, "n_next": 1.5},
+      {"point": {"x": 4, "y": 0}, "normal": {"x": 1, "y": 0}, "n_next": 1.0}
+    ],
+    "observation_line": {"point": {"x": 10, "y": 0}, "normal": {"x": 1, "y": 0}}
+  }'
+```
+
+上例观察线法线为 `(1,0)`，切向量为 `(0,1)`，`target_offset = 1.0` 表示目标点为 `(10, 1)`。
+
+### 瞄准求解响应说明
+
+```json
+{
+  "half_angle_deg": 10.0,
+  "sample_count": 21,
+  "target_offset": 1.0,
+  "target_point": {"x": 10.0, "y": 1.0},
+  "solution_count": 1,
+  "solutions": [
+    {
+      "emission_angle_deg": 6.118255615234375,
+      "direction": {"x": 0.9943040357, "y": 0.1065808825},
+      "observation_point": {"x": 10.0, "y": 0.9999994632},
+      "target_deviation": -5.3676e-07
+    }
+  ]
+}
+```
+
+- `target_point`：由观察线给定点与 `target_offset` 沿切向量确定的目标点。
+- `solutions[]` 按发射角从小到大排列并按 `1e-7` 度去重，每个解含：
+  - `emission_angle_deg`：相对中心方向的发射角（度，逆时针为正）；
+  - `direction`：穿过全部界面后的**出射方向**（归一化）；
+  - `observation_point`：出射段与观察线的前向交点；
+  - `target_deviation`：交点沿切向相对目标点的有符号距离，收敛后绝对值不超过 `1e-6`（角度宽度兜底时取偏差更小的端点）。
+- 扫描范围内无符号变化且无采样点直接命中时：`solution_count` 为 0，`solutions` 为 `[]`。
 
 ## 项目结构
 

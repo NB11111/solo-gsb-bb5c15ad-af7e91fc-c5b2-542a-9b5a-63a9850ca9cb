@@ -121,3 +121,41 @@ class BeamEvaluationOut(BaseModel):
     centroid: Vec2 | None
     rms_radius: float | None
     rays: list[BeamRayOut]
+
+
+class AimRequest(BaseModel):
+    """瞄准求解：在光束扫描范围内求光线穿过观察线上目标点的发射角。"""
+
+    start: Vec2
+    center_direction: Vec2
+    half_angle_deg: float = Field(gt=0, lt=90, description="对称半角（度），0<a<90")
+    sample_count: int = Field(ge=2, le=101, description="扫描采样数，2～101（含端点）")
+    target_offset: float = Field(
+        description="沿观察线单位切向量（法线逆时针旋转 90°）相对观察线给定点的有符号距离"
+    )
+    n_start: float = Field(gt=0, description="起始介质折射率，必须为正")
+    interfaces: list[InterfaceIn] = Field(default_factory=list)
+    observation_line: ObservationLineIn
+
+    @field_validator("center_direction")
+    @classmethod
+    def direction_nonzero(cls, v: Vec2) -> Vec2:
+        if math.hypot(v.x, v.y) < _EPS:
+            raise ValueError("中心方向不能为零向量")
+        return v
+
+
+class AimSolutionOut(BaseModel):
+    emission_angle_deg: float
+    direction: Vec2
+    observation_point: Vec2
+    target_deviation: float
+
+
+class AimSolutionsOut(BaseModel):
+    half_angle_deg: float
+    sample_count: int
+    target_offset: float
+    target_point: Vec2
+    solution_count: int
+    solutions: list[AimSolutionOut]

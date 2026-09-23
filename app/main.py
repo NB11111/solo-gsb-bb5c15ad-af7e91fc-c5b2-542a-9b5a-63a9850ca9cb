@@ -6,6 +6,7 @@ GET  /api/traces/{trace_id}           按编号查询完整追迹（含各段交
 GET  /api/traces/{trace_id}/segments/{seg_index}  按编号查询某一段
 POST /api/beam-evaluations            以中心方向为轴对称采样多条光线，返回每条光线
                                       的发射角、追迹状态、观察线交点及质心/RMS 半径
+POST /api/aim-solutions               扫描发射角并二分求穿过观察线上目标点的解
 """
 from __future__ import annotations
 
@@ -17,10 +18,14 @@ from . import db
 from .geometry import (
     centroid_and_rms,
     observation_intersection,
+    observation_tangent,
     sample_directions,
+    solve_aim,
     trace_ray,
 )
 from .schemas import (
+    AimRequest,
+    AimSolutionsOut,
     BeamEvaluationOut,
     BeamRequest,
     SegmentOut,
@@ -145,4 +150,58 @@ def evaluate_beam(req: BeamRequest) -> dict:
         "centroid": None if stats is None else {"x": stats[0][0], "y": stats[0][1]},
         "rms_radius": None if stats is None else stats[1],
         "rays": rays_out,
+    }
+
+
+@app.post("/api/aim-solutions", response_model=AimSolutionsOut)
+def solve_aim_solutions(req: AimRequest) -> dict:
+    """在半角范围内扫描发射角，二分求穿过观察线上目标点的光线。
+
+    目标点沿观察线切向量（法线逆时针旋转 90°）由给定点偏移 target_offset 得到。
+    等间距扫描后仅对相邻有效采样目标偏差异号的区间二分；二分中遇无效追迹或无前向
+    交点则丢弃该区间，不跨无效采样连根。返回按角度排序、按 1e-7 度去重的解；
+    采样点直接命中（|偏差|<=1e-6）也返回；无解返回空列表。即时计算，不入库。
+    """
+    interfaces = [
+        (itf.point.as_tuple(), itf.normal.as_tuple(), itf.n_next)
+        for itf in req.interfaces
+    ]
+    obs_point = req.observation_line.point.as_tuple()
+    obs_normal = req.observation_line.normal.as_tuple()
+
+    solutions = solve_aim(
+        req.start.as_tuple(),
+        req.center_direction.as_tuple(),
+        req.n_start,
+        interfaces,
+        obs_point,
+        obs_normal,
+        req.half_angle_deg,
+        req.target_offset,
+        req.sample_count,
+    )
+
+    tangent = observation_tangent(obs_normal)
+    target_point = (
+        obs_point[0] + req.target_offset * tangent[0],
+        obs_point[1] + req.target_offset * tangent[1],
+    )
+    return {
+        "half_angle_deg": req.half_angle_deg,
+        "sample_count": req.sample_count,
+        "target_offset": req.target_offset,
+        "target_point": {"x": target_point[0], "y": target_point[1]},
+        "solution_count": len(solutions),
+        "solutions": [
+            {
+                "emission_angle_deg": s.angle_deg,
+                "direction": {"x": s.direction[0], "y": s.direction[1]},
+                "observation_point": {
+                    "x": s.observation_point[0],
+                    "y": s.observation_point[1],
+                },
+                "target_deviation": s.deviation,
+            }
+            for s in solutions
+        ],
     }
